@@ -10,12 +10,27 @@
 
 import argparse
 import math
+import os
 import sys
+import time
 
 from mss import MSS
-from PySide6.QtCore import QPoint, QRect, Qt, QTimer
+from mss.exception import ScreenShotError
+from PySide6.QtCore import QObject, QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen
-from PySide6.QtWidgets import QApplication, QGridLayout, QSizePolicy, QWidget
+from PySide6.QtMultimedia import (
+    QMediaCaptureSession,
+    QScreenCapture,
+    QVideoFrame,
+    QVideoSink,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QGridLayout,
+    QMessageBox,
+    QSizePolicy,
+    QWidget,
+)
 
 
 def shot_to_image(shot) -> QImage:
@@ -68,6 +83,58 @@ def scale_percent(value: str) -> float:
     if not 0 < number <= 100:
         raise argparse.ArgumentTypeError("스케일은 0 초과 100 이하이어야 합니다.")
     return number
+
+
+def capture_backend(value: str) -> str:
+    backend = value.strip().lower()
+    if backend not in {"auto", "mss", "qt"}:
+        raise argparse.ArgumentTypeError("백엔드는 auto, mss, qt 중 하나여야 합니다.")
+    return backend
+
+
+def is_wayland_session() -> bool:
+    return (
+        sys.platform.startswith("linux")
+        and (
+            os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"
+            or bool(os.environ.get("WAYLAND_DISPLAY"))
+        )
+    )
+
+
+class QtCaptureSource(QObject):
+    """Qt Multimedia 기반의 운영체제 공통 비동기 화면 캡처."""
+
+    def __init__(self, screen, fps: int, frame_callback, error_callback, parent=None):
+        super().__init__(parent)
+        self._frame_callback = frame_callback
+        self._minimum_interval = 1.0 / fps
+        self._last_frame_time = 0.0
+        self.capture = QScreenCapture(self)
+        self.session = QMediaCaptureSession(self)
+        self.sink = QVideoSink(self)
+
+        # Wayland에서는 프로토콜 제한 때문에 화면을 API로 지정할 수 없고,
+        # start() 시 XDG Desktop Portal의 화면 선택 창이 표시된다.
+        if not is_wayland_session():
+            self.capture.setScreen(screen)
+        self.session.setScreenCapture(self.capture)
+        self.session.setVideoSink(self.sink)
+        self.sink.videoFrameChanged.connect(self._on_frame)
+        self.capture.errorOccurred.connect(error_callback)
+
+    def _on_frame(self, frame: QVideoFrame) -> None:
+        now = time.monotonic()
+        if self._last_frame_time and now - self._last_frame_time < self._minimum_interval:
+            return
+        self._last_frame_time = now
+        self._frame_callback(frame)
+
+    def start(self) -> None:
+        self.capture.start()
+
+    def stop(self) -> None:
+        self.capture.stop()
 
 
 class CapturePanel(QWidget):
@@ -239,30 +306,70 @@ class CapturePanel(QWidget):
 
 
 class MonitorPIP(QWidget):
-    def __init__(self, monitor_numbers_: list[int], fps: int, scale: float):
+    def __init__(
+        self, monitor_numbers_: list[int], fps: int, scale: float, backend: str = "auto"
+    ):
         super().__init__()
 
-        self._sct = MSS()
-        all_monitors = [dict(monitor) for monitor in self._sct.monitors[1:]]
-        invalid = [number for number in monitor_numbers_ if number > len(all_monitors)]
+        screens = QApplication.screens()
+        invalid = [number for number in monitor_numbers_ if number > len(screens)]
         if invalid:
-            self._sct.close()
             invalid_text = ", ".join(map(str, invalid))
             raise ValueError(
                 f"모니터 {invalid_text}번을 찾을 수 없습니다. "
-                f"감지된 모니터 수: {len(all_monitors)}"
+                f"감지된 모니터 수: {len(screens)}"
             )
 
+        self.backend = (
+            "qt" if backend == "qt" or (backend == "auto" and is_wayland_session())
+            else "mss"
+        )
         self.monitor_numbers = monitor_numbers_
-        self.monitors = [all_monitors[number - 1] for number in monitor_numbers_]
-        self.backgrounds = [
-            shot_to_image(self._sct.grab(monitor)) for monitor in self.monitors
-        ]
+        self.target_screens = [screens[number - 1] for number in monitor_numbers_]
+        self._sct: MSS | None = None
+        self.qt_sources: list[QtCaptureSource] = []
+        self._capture_error_shown = False
+        self._next_wayland_source = 0
 
-        screens = QApplication.screens()
-        self.target_screens = [
-            screens[min(number - 1, len(screens) - 1)] for number in monitor_numbers_
-        ]
+        if self.backend == "mss":
+            try:
+                self._sct = MSS()
+                all_monitors = [dict(monitor) for monitor in self._sct.monitors[1:]]
+                invalid = [
+                    number for number in monitor_numbers_ if number > len(all_monitors)
+                ]
+                if invalid:
+                    invalid_text = ", ".join(map(str, invalid))
+                    self._sct.close()
+                    self._sct = None
+                    raise ValueError(
+                        f"모니터 {invalid_text}번을 찾을 수 없습니다. "
+                        f"mss가 감지한 모니터 수: {len(all_monitors)}"
+                    )
+                self.monitors = [
+                    all_monitors[number - 1] for number in monitor_numbers_
+                ]
+                self.backgrounds: list[QImage | None] = [
+                    shot_to_image(self._sct.grab(monitor))
+                    for monitor in self.monitors
+                ]
+            except (ScreenShotError, PermissionError, OSError):
+                if self._sct is not None:
+                    self._sct.close()
+                raise
+        else:
+            # 실제 프레임 크기는 첫 QVideoFrame을 받을 때 갱신한다.
+            self.monitors = []
+            for screen in self.target_screens:
+                geometry = screen.geometry()
+                ratio = screen.devicePixelRatio()
+                self.monitors.append(
+                    {
+                        "width": max(1, round(geometry.width() * ratio)),
+                        "height": max(1, round(geometry.height() * ratio)),
+                    }
+                )
+            self.backgrounds = [None] * len(self.monitors)
 
         number_text = ",".join(map(str, monitor_numbers_))
         self.setWindowTitle(f"Monitor {number_text} PIP")
@@ -296,7 +403,68 @@ class MonitorPIP(QWidget):
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._timer.timeout.connect(self.capture)
-        self._timer.start(max(1, round(1000 / fps)))
+        if self.backend == "mss":
+            self._timer.start(max(1, round(1000 / fps)))
+        else:
+            for index, screen in enumerate(self.target_screens):
+                source = QtCaptureSource(
+                    screen,
+                    fps,
+                    lambda frame, i=index: self._receive_qt_frame(i, frame),
+                    lambda error, message, i=index: self._capture_failed(
+                        i, message or str(error)
+                    ),
+                    self,
+                )
+                self.qt_sources.append(source)
+
+    def start(self) -> None:
+        if self.backend == "mss":
+            self.show()
+            self.capture()
+            return
+
+        # Wayland의 Portal 선택 창은 여러 개를 동시에 열지 않도록 순차 시작한다.
+        if is_wayland_session():
+            self.qt_sources[0].start()
+            self._next_wayland_source = 1
+        else:
+            for source in self.qt_sources:
+                source.start()
+
+    def _receive_qt_frame(self, index: int, video_frame: QVideoFrame) -> None:
+        image = video_frame.toImage()
+        if image.isNull():
+            return
+        image = image.convertToFormat(QImage.Format.Format_RGB32)
+        self.monitors[index]["width"] = image.width()
+        self.monitors[index]["height"] = image.height()
+
+        if self.backgrounds[index] is None:
+            self.backgrounds[index] = image.copy()
+            self.panels[index].set_image(image)
+
+            if (
+                is_wayland_session()
+                and self._next_wayland_source < len(self.qt_sources)
+            ):
+                self.qt_sources[self._next_wayland_source].start()
+                self._next_wayland_source += 1
+
+            if all(background is not None for background in self.backgrounds):
+                self.show()
+            return
+
+        self._display_frame(index, image)
+
+    def _display_frame(self, index: int, frame: QImage) -> None:
+        covered = self._covered_capture_rect(index)
+        background = self.backgrounds[index]
+        if not covered.isEmpty() and background is not None:
+            painter = QPainter(frame)
+            painter.drawImage(covered, background, covered)
+            painter.end()
+        self.panels[index].set_image(frame)
 
     def _covered_capture_rect(self, index: int) -> QRect:
         """PIP 창과 대상 모니터가 겹치는 영역을 캡처 픽셀 좌표로 반환한다."""
@@ -320,14 +488,37 @@ class MonitorPIP(QWidget):
         return rect.intersected(QRect(0, 0, monitor["width"], monitor["height"]))
 
     def capture(self) -> None:
+        if self._sct is None:
+            return
         for index, (monitor, panel) in enumerate(zip(self.monitors, self.panels)):
-            frame = shot_to_image(self._sct.grab(monitor))
-            covered = self._covered_capture_rect(index)
-            if not covered.isEmpty():
-                painter = QPainter(frame)
-                painter.drawImage(covered, self.backgrounds[index], covered)
-                painter.end()
-            panel.set_image(frame)
+            try:
+                frame = shot_to_image(self._sct.grab(monitor))
+            except (ScreenShotError, PermissionError, OSError) as exc:
+                self._capture_failed(index, str(exc))
+                return
+            self._display_frame(index, frame)
+
+    def _capture_failed(self, index: int, message: str) -> None:
+        if self._capture_error_shown:
+            return
+        self._capture_error_shown = True
+        self._timer.stop()
+        for source in self.qt_sources:
+            source.stop()
+
+        number = self.monitor_numbers[index]
+        detail = message or "운영체제에서 화면 캡처를 허용하지 않았습니다."
+        if sys.platform == "darwin":
+            detail += (
+                "\n\n시스템 설정 > 개인정보 보호 및 보안 > 화면 및 시스템 오디오 "
+                "기록에서 Python(또는 사용 중인 터미널)을 허용한 뒤 다시 실행하세요."
+            )
+        elif is_wayland_session():
+            detail += (
+                "\n\nXDG Desktop Portal ScreenCast와 PipeWire 0.3이 설치·실행 중인지 "
+                "확인하세요."
+            )
+        QMessageBox.critical(self, f"Monitor {number} 캡처 오류", detail)
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Escape:
@@ -340,7 +531,10 @@ class MonitorPIP(QWidget):
             return
         self._closed = True
         self._timer.stop()
-        self._sct.close()
+        for source in self.qt_sources:
+            source.stop()
+        if self._sct is not None:
+            self._sct.close()
 
     def closeEvent(self, event) -> None:
         self.release()
@@ -363,6 +557,10 @@ def build_parser() -> argparse.ArgumentParser:
         "-s", "--scale", type=scale_percent, default=10.0,
         help="모니터 한 칸의 크기 백분율(기본값: 10, '10%%'도 허용)",
     )
+    parser.add_argument(
+        "--backend", type=capture_backend, default="auto",
+        help="캡처 방식: auto, mss, qt(기본값: auto)",
+    )
     return parser
 
 
@@ -371,14 +569,13 @@ def main() -> int:
     app = QApplication(sys.argv)
 
     try:
-        window = MonitorPIP(args.monitor, args.fps, args.scale)
-    except ValueError as exc:
+        window = MonitorPIP(args.monitor, args.fps, args.scale, args.backend)
+    except (ValueError, ScreenShotError, PermissionError, OSError) as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return 2
 
     app.aboutToQuit.connect(window.release)
-    window.show()
-    window.capture()
+    window.start()
     return app.exec()
 
 
